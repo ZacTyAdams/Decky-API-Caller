@@ -1,57 +1,80 @@
-import os
-
-# The decky plugin module is located at decky-loader/plugin
-# For easy intellisense checkout the decky-loader code repo
-# and add the `decky-loader/plugin/imports` path to `python.analysis.extraPaths` in `.vscode/settings.json`
-import decky
 import asyncio
+import json
+import os
+import urllib.error
+import urllib.request
+import uuid
+from urllib.parse import urlparse
+
+import decky
+
+ALLOWED_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
+REQUEST_TIMEOUT = 10
+
 
 class Plugin:
-    # A normal method. It can be called from the TypeScript side using @decky/api.
-    async def add(self, left: int, right: int) -> int:
-        return left + right
+    def _buttons_path(self) -> str:
+        return os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, "buttons.json")
 
-    async def long_running(self):
-        await asyncio.sleep(15)
-        # Passing through a bunch of random data, just as an example
-        await decky.emit("timer_event", "Hello from the backend!", True, 2)
+    def _load(self) -> list:
+        try:
+            with open(self._buttons_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except (OSError, ValueError):
+            return []
 
-    # Asyncio-compatible long-running code, executed in a task when the plugin is loaded
+    def _save(self, buttons: list) -> None:
+        os.makedirs(decky.DECKY_PLUGIN_SETTINGS_DIR, exist_ok=True)
+        with open(self._buttons_path(), "w", encoding="utf-8") as f:
+            json.dump(buttons, f, indent=2)
+
+    async def get_buttons(self) -> list:
+        return self._load()
+
+    async def add_button(self, name: str, url: str, method: str = "GET") -> dict:
+        name = (name or "").strip()
+        url = (url or "").strip()
+        method = (method or "GET").upper()
+        parsed = urlparse(url)
+        if not name:
+            return {"ok": False, "error": "Name is required"}
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return {"ok": False, "error": "URL must start with http:// or https://"}
+        if method not in ALLOWED_METHODS:
+            return {"ok": False, "error": "Unsupported method"}
+        buttons = self._load()
+        buttons.append({"id": uuid.uuid4().hex, "name": name, "url": url, "method": method})
+        self._save(buttons)
+        return {"ok": True, "buttons": buttons}
+
+    async def delete_button(self, button_id: str) -> list:
+        buttons = [b for b in self._load() if b.get("id") != button_id]
+        self._save(buttons)
+        return buttons
+
+    def _request(self, url: str, method: str) -> dict:
+        data = b"" if method in ("POST", "PUT", "PATCH") else None
+        req = urllib.request.Request(url, data=data, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                return {"ok": True, "status": resp.status}
+        except urllib.error.HTTPError as e:
+            return {"ok": False, "status": e.code, "error": f"HTTP {e.code}"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    async def call_api(self, button_id: str) -> dict:
+        button = next((b for b in self._load() if b.get("id") == button_id), None)
+        if button is None:
+            return {"ok": False, "error": "Button not found"}
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, self._request, button["url"], button["method"])
+        decky.logger.info(f"Called {button['method']} {button['url']}: {result}")
+        return result
+
     async def _main(self):
-        self.loop = asyncio.get_event_loop()
-        decky.logger.info("Hello World!")
+        decky.logger.info("Decky API Caller loaded")
 
-    # Function called first during the unload process, utilize this to handle your plugin being stopped, but not
-    # completely removed
     async def _unload(self):
-        decky.logger.info("Goodnight World!")
-        pass
-
-    # Function called after `_unload` during uninstall, utilize this to clean up processes and other remnants of your
-    # plugin that may remain on the system
-    async def _uninstall(self):
-        decky.logger.info("Goodbye World!")
-        pass
-
-    async def start_timer(self):
-        self.loop.create_task(self.long_running())
-
-    # Migrations that should be performed before entering `_main()`.
-    async def _migration(self):
-        decky.logger.info("Migrating")
-        # Here's a migration example for logs:
-        # - `~/.config/decky-template/template.log` will be migrated to `decky.decky_LOG_DIR/template.log`
-        decky.migrate_logs(os.path.join(decky.DECKY_USER_HOME,
-                                               ".config", "decky-template", "template.log"))
-        # Here's a migration example for settings:
-        # - `~/homebrew/settings/template.json` is migrated to `decky.decky_SETTINGS_DIR/template.json`
-        # - `~/.config/decky-template/` all files and directories under this root are migrated to `decky.decky_SETTINGS_DIR/`
-        decky.migrate_settings(
-            os.path.join(decky.DECKY_HOME, "settings", "template.json"),
-            os.path.join(decky.DECKY_USER_HOME, ".config", "decky-template"))
-        # Here's a migration example for runtime data:
-        # - `~/homebrew/template/` all files and directories under this root are migrated to `decky.decky_RUNTIME_DIR/`
-        # - `~/.local/share/decky-template/` all files and directories under this root are migrated to `decky.decky_RUNTIME_DIR/`
-        decky.migrate_runtime(
-            os.path.join(decky.DECKY_HOME, "template"),
-            os.path.join(decky.DECKY_USER_HOME, ".local", "share", "decky-template"))
+        decky.logger.info("Decky API Caller unloaded")
